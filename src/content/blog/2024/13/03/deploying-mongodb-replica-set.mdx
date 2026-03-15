@@ -1,0 +1,362 @@
+---
+title: "Deploying a MongoDB Replica Set"
+date: 2024-13-03
+description: "Deploying a MongoDB Replica set on Windows Server 2016 and Ubuntu"
+category: blog
+tags: [mongodb, linux]
+---
+
+![woods](woods.png)
+<small>Photo by Oskars Sylwan on Unsplash</small>
+
+For testing and development, a standalone MongoDB instance offers a quick and easy setup. However, it lacks replication and high availability; this makes it unsuitable for a production environment. Or as MongoDB themselves put it:
+
+---
+
+**Disclaimer:** I've written and tested this tutorial for Windows Server 2016 and Ubuntu 22.04.4 LTS. However, I'm confident it'll work just fine on versions close to these.
+This tutorial does not involve Atlas. This is for MongoDB Enterprise or Community Edition servers.
+**Do not use these deployments for production systems** as they lack replication and high availability. For all production deployments use replica sets.
+
+Replica sets maintain the same data set. When you connect to a replica set, you connect to the primary node (by default). Any changes you make to the primary node will be distributed to the secondary nodes.
+The secondary nodes are ready to take over the primary node if it becomes unhealthy. This is great for a production environment where connection to our MongoDB data is critical.
+
+Sounds amazing I know! So let's get started.
+
+---
+
+## Summary
+
+In this guide, we'll setup a replica set of three nodes. A primary and two secondary instances. You may also decide to increase the number of secondary nodes to further improve the dependability of your set.
+
+### Ports
+We'll be using the default port numbers, these can be changed to suit your network/firewall configuration.
+
+- **Primary** — 27017
+- **Secondary** — 27020
+- **Secondary** — 27030
+
+### Prerequisites
+You'll need either MongoDB Enterprise or Community Server running on your machine.
+You can check this with `mongosh`. This'll connect you to a `mongod` that is running on default port 27017.
+
+---
+
+## Step 1
+
+Let's create two directory structures for our secondary nodes.
+This is considered a preference, so feel free to use folders that work for you.
+
+### Ubuntu
+On Ubuntu, MongoDB makes the following folders for the primary node:
+- config — `/etc/mongod.conf`
+- db — `/var/lib/mongodb`
+- log — `/var/log/mongodb.log`
+
+We'll create similar folders for the secondary nodes but keep them all together for simplicity. We'll then need to give the mongo user `mongodb` ownership of these folders.
+
+```bash
+sudo mkdir -p /var/lib/mongodb-sec1/db
+sudo mkdir -p /var/lib/mongodb-sec1/log
+sudo mkdir -p /var/lib/mongodb-sec1/config
+
+# Give MongoDB's user, mongodb ownership of the folder
+sudo chown -R mongodb:mongodb /var/lib/mongodb-sec1
+
+sudo mkdir -p /var/lib/mongodb-sec2/db
+sudo mkdir -p /var/lib/mongodb-sec2/log
+sudo mkdir -p /var/lib/mongodb-sec2/config
+
+sudo chown -R mongodb:mongodb /var/lib/mongodb-sec2
+
+# Repeat above if you've would like more than two secondary nodes
+```
+
+### Windows
+On Windows, MongoDB makes the following folders for the primary node:
+- config — `C:\Program Files\MongoDB\Server\*version*\data`
+- db — `C:\Program Files\MongoDB\Server\*version*\config`
+- log — `C:\Program Files\MongoDB\Server\*version*\log`
+
+Let's make the sub-folders for our secondary nodes. Please feel free to change the location of the parent folder to what suits you.
+
+```bash
+mkdir c:\mongodb-sec1\db
+mkdir c:\mongodb-sec1\config
+mkdir c:\mongodb-sec1\log
+
+mkdir c:\mongodb-sec2\db
+mkdir c:\mongodb-sec2\config
+mkdir c:\mongodb-sec2\log
+```
+
+---
+
+## Step 2
+
+Inside of each of the secondary node folders we created in Step 1, create a `mongod.conf` inside of the config folder.
+In each of these files, add the following:
+
+```conf
+--dbpath "*PATH*/db"
+--logpath "*PATH*/log/mongod.log"
+--storageEngine "wiredTiger"
+--port *NODE PORT*
+```
+
+Where `*PATH*` is the directory to your secondary node's parent folder (Remember to use absolute paths!).
+
+**Example (Ubuntu):**
+
+```conf
+# /var/lib/mongodb-sec1/config/mongod.conf
+--dbpath "/var/lib/mongodb-sec1/db"
+--logpath "/var/lib/mongodb-sec1/log/mongod.log"
+--storageEngine "wiredTiger"
+--port 27020
+```
+
+```conf
+# /var/lib/mongodb-sec2/config/mongod.conf
+--dbpath "/var/lib/mongodb-sec2/db"
+--logpath "/var/lib/mongodb-sec2/log/mongod.log"
+--storageEngine "wiredTiger"
+--port 27030
+```
+
+---
+
+## Step 3
+
+Next, we're going to start the primary node and specify that it's part of a replica set.
+
+```bash
+sudo mongod --dbpath "*DBPATH*" --logpath "*LOGPATH*" --port *PORT* --storageEngine=wiredTiger --journal --replSet *name*
+```
+
+Where:
+- `dbpath` = Path to your primary db folder (e.g. Ubuntu: `/var/lib/mongodb`, Windows: `C:\Program Files\MongoDB\Server\4.4\data`)
+- `logpath` = Path to your primary node's log file
+- `port` = Primary node port (default = 27017)
+- `name` = Name of your replica set
+
+You should see an output similar to:
+
+```
+{"t":{"$date":"2024-03-13T11:16:07.245Z"},"s":"I", "c":"CONTROL", "id":20697, "ctx":"main","msg":"Renamed existing log file","attr":{"oldLogPath":"/var/log/mongodb/mongod.log","newLogPath":"/var/log/mongodb/mongod.log.2024-03-13T11-16-07"}}
+```
+
+---
+
+## Step 4
+
+Now, create a new terminal session.
+Let's connect to our primary instance again in a new session and see if we can see any databases.
+
+```bash
+mongosh --port 27017
+```
+
+```javascript
+test> show dbs
+MongoServerError[NotPrimaryOrSecondary]: node is not in primary or recovering state
+```
+
+We need to create a replica set configuration and add the primary node as the first member.
+
+```javascript
+> rsconfig={_id: "*name*", members:[{_id:0,host:"localhost:27017"}]}
+{
+  _id: "*name*",
+  members: [ { _id: 0, host: 'localhost:27017' } ]
+}
+```
+
+Where `*name*` is your replica set name you set earlier.
+
+Let's now assign the configuration:
+
+```javascript
+> rs.initiate(rsconfig)
+{ ok: 1 }
+```
+
+If you run `show dbs` again you should now see:
+
+```javascript
+> show dbs
+admin    48.00 KiB
+config  176.00 KiB
+local   308.00 KiB
+```
+
+---
+
+## Step 5
+
+Now we've correctly set up the primary node, let's attach our secondary nodes to the set!
+Let's create another terminal session (You should have three open 😱).
+You'll need to open a new terminal each time, remember to keep the old ones open! If your terminal takes you to a new line after you enter this, the node hasn't started. Check your variables in the script.
+
+For each of your secondary nodes:
+
+```bash
+sudo mongod --dbpath "*DBPATH*" --logpath "*LOGPATH*" --port *PORT* --storageEngine=wiredTiger --journal --replSet *name*
+```
+
+Where:
+- `dbpath` = Path to your secondary node's db folder
+- `logpath` = Path to your secondary node's log file
+- `port` = Secondary node port
+- `name` = Name of your replica set
+
+Now, let's head back to the primary node terminal session. (Should be the second one)
+
+For each of your secondary nodes:
+
+```javascript
+> rs.add("localhost:*PORT*")
+{
+  ok: 1,
+  '$clusterTime': {
+    clusterTime: Timestamp({ t: 1710330078, i: 1 }),
+    signature: {
+      hash: Binary.createFromBase64('AAAAAAAAAAAAAAAAAAAAAAAAAAA=', 0),
+      keyId: Long('0')
+    }
+  },
+  operationTime: Timestamp({ t: 1710330078, i: 1 })
+}
+```
+
+Where `*PORT*` is the port of your secondary node (e.g. 27020 and 27030).
+
+You can check if they've been added with:
+
+```javascript
+rs.status()
+```
+
+You should see your nodes inside of the `members[]` field! 🚀
+
+---
+
+## Step 6
+
+Now we've added the secondary nodes to the replica set, we need to inform them that they're working for the big boss primary node.
+
+**On Ubuntu**, they should already know. You can check this with:
+
+```javascript
+> show dbs
+```
+
+If you get an error, you'll need to tell the secondary node it works for the primary node. Open another terminal session.
+
+You'll need to perform the steps below for each of your secondary nodes:
+
+```bash
+mongosh --port *SECONDARY NODE PORT*
+```
+
+```javascript
+> rs.secondaryOk()
+Setting read preference from "primary" to "primaryPreferred"
+```
+
+---
+
+## Testing
+
+Head back to the primary node session.
+
+```javascript
+use *Database name*
+```
+
+Next, we'll create a database and add two entries. They should also exist on the secondary nodes which we'll check after.
+
+```javascript
+> db.employee.insert({"forename": "Bruce", "surname": "Wayne"});
+{
+  acknowledged: true,
+  insertedIds: { '0': ObjectId('65f1980aa49338de9b12158e') }
+}
+
+> db.employee.insert({"forename": "Clark", "surname": "Kent"});
+{
+  acknowledged: true,
+  insertedIds: { '0': ObjectId('65f19883a49338de9b12158f') }
+}
+```
+
+Now let's check if the database is created:
+
+```javascript
+> show dbs
+admin         80.00 KiB
+config       244.00 KiB
+*Database name*   40.00 KiB
+local        444.00 KiB
+```
+
+Great, now let's check if it's also on our secondary nodes.
+Switch to one of your secondary node terminal sessions and run `show dbs` again. You should see the populated database you just created.
+
+---
+
+## Connecting
+
+By default, you have to connect to your primary node unless you're using shell.
+
+### URI (Works for DataGrip, MongoDB, Mongoose, Motor…)
+```
+mongodb://localhost:27017/?directConnection=true&appName=mongosh+2.1.0
+```
+
+### Shell
+```bash
+mongosh --port 27017
+```
+
+---
+
+## Optional: Setting Priority
+
+At certain events, an election will take place to determine which set member will become the primary (e.g. server restart or primary node becomes unhealthy).
+This can cause the primary node to change. To solve this, you can set the priority of each node. The higher the priority, the more likely they'll win elections.
+
+We'll set our primary node on the default port of 27017 to a higher priority than the secondary nodes.
+
+```javascript
+# retrieve the replica set configuration and assign it to a variable
+> cfg = rs.conf()
+```
+
+```javascript
+cfg.members[0].priority = 2
+cfg.members[1].priority = 1
+cfg.members[2].priority = 1
+```
+
+Lastly, let's assign the new configuration:
+
+```javascript
+> rs.reconfig(cfg)
+```
+
+**WARNING:** This will cause an election and will close all client connections for 10–20 seconds.
+
+If there's a server restart, or some other unexpected election, we can be confident the primary node will continue to be on port 27017.
+
+---
+
+## Summary
+
+We've successfully setup a MongoDB Replica set with a single primary node and secondary nodes for a production environment! The primary node transmits changes in its database to the secondary nodes, increasing data redundancy.
+
+---
+
+## References
+- For a great Windows guide by E-MultiSkills Database services: [https://www.youtube.com/watch?v=91PCBRJxkh0](https://www.youtube.com/watch?v=91PCBRJxkh0)
+- Adjust Priority for Replica Set Member: [https://www.mongodb.com/docs/manual/tutorial/adjust-replica-set-member-priority/](https://www.mongodb.com/docs/manual/tutorial/adjust-replica-set-member-priority/)
+- About replica set elections: [https://www.mongodb.com/docs/manual/core/replica-set-elections/](https://www.mongodb.com/docs/manual/core/replica-set-elections/)

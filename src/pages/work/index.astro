@@ -1,0 +1,82 @@
+---
+import { getCollection } from "astro:content";
+import PageLayout from "@layouts/PageLayout.astro";
+import Container from "@components/Container.astro";
+import { dateRange } from "@lib/utils";
+import { WORK } from "@consts";
+
+const collection = (await getCollection("work"))
+  .sort((a, b) => new Date(b.data.dateStart).valueOf() - new Date(a.data.dateStart).valueOf());
+
+const work = await Promise.all(
+  collection.map(async (item) => {
+    const { Content } = await item.render();
+    return { ...item, Content };
+  })
+);
+
+// ──────────────────────────────────────────────────────────────
+// Group roles by company (using frontmatter `company` field)
+// Each folder (capgemini/, office-depot/, etc.) should have the
+// same `company` value in every .md file inside it.
+// ──────────────────────────────────────────────────────────────
+const groupedWork = work.reduce((acc: Record<string, any[]>, entry) => {
+  const company = entry.data.company as string;
+  if (!acc[company]) acc[company] = [];
+  acc[company].push(entry);
+  return acc;
+}, {});
+
+// Sort companies by their most recent role (reverse chrono)
+const sortedCompanyNames = Object.keys(groupedWork).sort((a, b) => {
+  const latestA = Math.max(...groupedWork[a].map((e: any) => new Date(e.data.dateStart).getTime()));
+  const latestB = Math.max(...groupedWork[b].map((e: any) => new Date(e.data.dateStart).getTime()));
+  return latestB - latestA;
+});
+---
+
+<PageLayout title={WORK.TITLE} description={WORK.DESCRIPTION}>
+    <Container>
+        <div class="space-y-10">
+            <!-- Grouped by company -->
+            <div class="space-y-12">
+              {
+                sortedCompanyNames.map((company) => {
+                  // Sort roles inside each company (most recent first)
+            const companyRoles = [...groupedWork[company]].sort(
+                    (a, b) => new Date(b.data.dateStart).valueOf() - new Date(a.data.dateStart).valueOf()
+                  );
+
+                  return (
+                          <div class="animate">
+                              <!-- Company header -->
+                              <div class="font-semibold text-black dark:text-white mb-6">
+                                {company}
+                              </div>
+
+                              <!-- Roles under this company -->
+                              <ul class="flex flex-col space-y-6">
+                                {
+                                  companyRoles.map((entry) => (
+                                          <li>
+                                              <div class="text-sm opacity-75">
+                                                {dateRange(entry.data.dateStart, entry.data.dateEnd)}
+                                              </div>
+                                              <div class="font-semibold text-black dark:text-white">
+                                                {entry.data.role}
+                                              </div>
+                                              <article class="mt-2">
+                                                  <entry.Content />
+                                              </article>
+                                          </li>
+                                  ))
+                                }
+                              </ul>
+                          </div>
+                  );
+                })
+              }
+            </div>
+        </div>
+    </Container>
+</PageLayout>
