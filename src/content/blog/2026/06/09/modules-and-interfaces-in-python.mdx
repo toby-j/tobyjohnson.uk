@@ -1,0 +1,210 @@
+---
+title: "Modules and interface in Python"
+date: 2026-09-06
+description: "Modular approach to service architecture in Python."
+category: blog
+tags: [python]
+---
+
+![sunset](./sunset.png)
+<small>A 5am sunrise hiking in Madeira</small>
+
+While working on a project, I've been tasked to take a monolith, azure focused repository and convert for use in an offline environment.
+
+This challenge was further complicated with the involvement of two workstreams, one for the online and one for the offline environment.
+
+There was a quick consensus that we needed a modular style of architecture, but other considerations such as the impact on the online team, scalability, testing etc.. quickly came into the picture.
+
+In this document, I propose an interface and module pattern which has the following features:
+
+- Creating a module is just creating a file
+- Modules are lazily imported
+- Standardised health checks
+- Nominal typing
+- Additional interface capabilities (Startable, DynamicCredentialsCapable)
+- Initialisation profiles
+
+**What is an interface?**
+
+A set of abstract functions, a set of rules for Modules to meet.
+
+A interface can support many modules, but can only have one attached at one time.
+
+**What is a module?**
+
+Logic that interacts with a service, such as Redis. Implementing the functions defined in the module's interface.
+
+For example, the interface for Redis is Cache. The Redis module must implement the rules defined by the Cache interface.
+
+**What is a registry?**
+
+Each interface has a registry, it discovers available modules, then decides which is going to be attached to the interface.
+
+The application code imports the registry and through it, is able to access the interface, which behind the scenes, uses the connected module.
+
+# Use case
+
+If in your application, you need to interact with multiple services in similar ways, you may be able to use an abstraction method such as this to make your code easier to read and maintain.
+
+Even if you have no plans of changing a service for a use case, building a codebase around modularity and compartmentalisation helps with:
+
+- Testing: modules often don't have dependencies, making them easy to test without having to reply on complicated mocks
+- Expandability: adding and depreciating a new service is much easier as it's isolated from the core codebase
+- Debugging: if there's an issue with a service, it's isolated to a single file.
+
+# Registry
+
+There's a single registry for each interface which is what the core application interacts with then it needs to use a module like Redis.
+
+`modules/__init__.py`
+```python
+cache_registry: Registry[Cache] = Registry(Cache, _settings.cache_backend)
+```
+
+`_settings.cache_backend` is a name for a module from the `.env` file. For example, "REDIS".
+
+`Cache` is the interface. Which defines a list of abstract functions and properties that a `Cache` module must implement. Such as `get()` and `set()`.
+
+If the core app needs to call on a cache module, it simply uses:
+
+```python
+cache_registry.default
+```
+
+This will be of type `Cache`, through nominal typing.
+
+# Interfaces
+
+Every module must implement an interface, which gives us our abstraction.
+
+Each interface implements the core `Module` class, there is where we can define functions that are enforced on all modules.
+
+For example, `health_check()` is ideal to place here. We can then confidently loop through every module and call it, like we do in `modkit/modules/preflight.py`.
+
+## Health checking
+
+```python
+
+class ServiceHealth(StrEnum):
+    OK = "ok"
+    TIMEOUT = "timeout"
+    UNREACHABLE = "unreachable"
+    AUTH_FAILED = "auth_failed"
+    UNKNOWN = "unknown"
+
+class HealthCheck(TypedDict):
+    healthy: bool
+    checks: dict[str, ServiceHealth]
+
+class HealthProbe:
+    """Async context manager: run a named check, classify anything it raises."""
+
+    def __init__(self, module: Module, name: str) -> None:
+        self._module = module
+        self.name = name
+        self.result: HealthCheck = {"healthy": True, "checks": {name: ServiceHealth.OK}}
+
+    def fail(self, code: ServiceHealth) -> None:
+        self.result = {"healthy": False, "checks": {self.name: code}}
+
+    async def __aenter__(self) -> "HealthProbe":
+        """
+        Entry method for setup. Returns instance to be used.
+        """
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool:
+        """
+        For cleanup and exception management when HealthProbe is async called
+        :return: Boolean -> true which suppresses exception, false which unwinds any caught
+        """
+        # BaseException (CancelledError etc.) is not a health signal: let it unwind.
+        if not isinstance(exc, Exception):
+            return False
+        code = self._module.classify_health_check_error(exc)
+        logger.warning("%s health check failed: %s", type(self._module).__name__, code)
+        self.fail(code)
+        return True
+```
+
+A health check is defined in a module, for example:
+
+**redis.py**
+```python
+    async def health_check(self) -> HealthCheck:
+        async with self.probe("ping") as probe:
+            async with asyncio.timeout(self._health_timeout):
+                await self.start()
+                await self._require_client().ping()
+        return probe.result
+```
+
+`HealthProbe` is a async context manager. Context managers must implement `__aexit__` and `__aenter__`, which are entry and exit cleanup functions.
+
+This is particularly useful here for our error handling. in `__aexit__` when the health check is finished, we can map an error to a useful debug code and return a human-readable report as a dict.
+
+This is much neater than a `try, catch` approach, which we would need to repeat in every module if health_check was a simple helper that threw.
+
+We can keep the logic to just the health check logic, then the context manager does a cleanup on what occurred during the check, if any errors were thrown etc..
+
+## preflight checking
+
+```python
+async def run_preflight() -> None:
+    errors: list[str] = []
+    checked: list[str] = []
+    for reg in REGISTRIES:
+        try:
+            module = reg.default
+            if isinstance(module, Startable):
+                await module.start()
+            result = await module.health_check()
+            if not result["healthy"]:
+                errors.append(f"{reg.category}: unhealthy {result['checks']}")
+            else:
+                checked.append(reg.category)
+        except Exception as exc:
+            errors.append(f"{reg.category}: {exc}")
+
+    if errors:
+        raise RuntimeError("Preflight failed:\n" + "\n".join(errors))
+
+    logger.info("preflight_passed: %s", checked)
+```
+
+Remember earlier we mentioned how the registries are imported lazily. Initialisation of an interface and it's attached module is only ran when they're imported.
+
+`run_preflight()` can be used to import every module for each registry and ensure its setup correctly by using the `health_check()` (The more comprehensive the health check the better!).
+
+Useful if you want to be sure your services are reachable and ready to be used before your core application starts.
+
+You can see the logic is fairly simple, for each registry we see if the module implements the Startable trait (if so, make sure we start it first) and then call the health check function enforced by the Module class.
+
+This example also showcases how easy testing is for this system as each and be individually imported via the registry without any service specific code leaking through or needing to be mocked.
+
+## Extensions
+
+If an interface has an extension, it can be found in the interface file. An extension is additional functionality that a module can inherit.
+
+For example, some vault providers provide dynamic credentials via their SDK, as you can see in `hashicorp.py`. Which rotates usernames and passwords on each request.
+
+You can see at the top of the HashiCorp class, it inherits the extension `DynamicCredentialsCapable`.
+
+This provides greater flexibly for our interfaces. Taking this a step further, we can check if a module implements an extension before we decide to use it.
+
+This can be seen in `run_preflight()` with:
+
+```python
+if isinstance(module, Startable):
+    # If the module inherits the startable extension (imported for the interface file), then we can confidently call .start() on it below with Nominal typing.
+    ...
+```
+## Taking this further
+
+- Hot-reloading is definitely possible with some tweaks given it's already lazy
+- Similar to health checks, some integration tests for each interface could be very minimal while achieve a good amount of coverage.
